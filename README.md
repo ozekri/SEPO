@@ -16,7 +16,7 @@ Note : **The repo is not complete at the moment.**
 
 ## What’s in this repository at the moment?
 
-**Full implementation** of the GRPO version of `SEPO` on a masked difusion language model [MDLM (Sahoo et al., 2023)](https://github.com/kuleshov-group/mdlm), with application to finetune a masked diffusion language model on DNA sequences. Extensible and modular codebase to facilitate further research.
+**Full implementation** of the GRPO version of `SEPO` on a masked difusion language model [MDLM (Sahoo et al., 2023)](https://github.com/kuleshov-group/mdlm), with an application on fine-tuning a masked diffusion language model on DNA sequences. Extensible and modular codebase to facilitate further research.
 
 ##### Key Files:
 - **`grpo_train.py`**: Contains the full iterative `SEPO` algorithm (GRPO version).
