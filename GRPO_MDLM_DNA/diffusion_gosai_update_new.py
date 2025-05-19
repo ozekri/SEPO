@@ -737,7 +737,185 @@ class Diffusion(L.LightningModule):
 
     return x[:, :, :-1] + (x_argmax - x[:, :, :-1]).detach(), last_x_list, condt_list, move_chance_t_list, copy_flag_list
 
-  def _compute_loss_sepo(self, rew, s_t_old_x_z, pi_old_z, x, t=0.0, epsilon=0.2, full_scores=True):
+  def enumerate_all_y(self, categorical_probs):
+    batch_size, sequence_length, vocab_size = categorical_probs.shape  # [B, L, d]
+    
+    # Sample a base sequence from the categorical distribution
+    base_sequences = torch.multinomial(categorical_probs.reshape(-1, vocab_size), 1).reshape(batch_size, sequence_length)  # [B, L]
+
+    # Create a tensor to hold all possible sequences
+    all_y = base_sequences.unsqueeze(2).expand(batch_size, sequence_length, vocab_size).clone()  # [B, L, d]
+
+    # For each position in the sequence, replace with all possible values (0 to d-1)
+    for l in range(sequence_length):
+        all_y[:, l, :] = torch.arange(vocab_size, device=categorical_probs.device)  # Replace position `l` with all possible values
+
+    # Reshape to have a list of all modified sequences
+    all_y = all_y.view(batch_size, -1, sequence_length)  # Shape: [B, L * d, L]
+    
+    return all_y
+
+  def generate_all_hamming_distance_0_and_1(self, x, vocab_size):
+    """
+    Given a batch of sequences x of shape [B, L], return all sequences where
+    each position is replaced by all possible tokens (including the original one).
+
+    Output shape: [B, L, vocab_size, L]
+    """
+    B, L = x.shape
+    device = x.device
+
+    # Repeat x for each position and each vocab entry
+    x_expanded = x.unsqueeze(1).unsqueeze(2).expand(B, L, vocab_size, L).clone()  # [B, L, d, L]
+
+    # Indices of positions to modify
+    positions = torch.arange(L, device=device).view(1, L, 1).expand(B, L, vocab_size)  # [B, L, d]
+
+    # Values to set
+    token_values = torch.arange(vocab_size, device=device).view(1, 1, vocab_size).expand(B, L, vocab_size)  # [B, L, d]
+
+    # Set token_values at the appropriate positions
+    x_expanded.scatter_(dim=3, index=positions.unsqueeze(-1), src=token_values.unsqueeze(-1))
+
+    return x_expanded  # [B, L, d, L]
+  
+  def compute_pi_z_given_y(self, t, all_y, chunk_size=1024):
+        """
+        Computes the conditional distribution π(z | y) for all positions and dimensions 
+        in the input tensor `all_y`, using chunked processing to reduce memory usage.
+
+        Args:
+            t (float): Current time or step in the diffusion process.
+            all_y (torch.Tensor): Tensor of shape [B, L, d, L] representing the set of 
+                                  conditional variables y for each batch, position, and dimension.
+                                  - B: Batch size
+                                  - L: Sequence length
+                                  - d: Vocabulary size
+            chunk_size (int, optional): Number of samples to process per chunk to avoid 
+                                        memory overflow. Default is 1024.
+
+        Returns:
+            torch.Tensor: A tensor of shape [B, L, d, L, d] representing π(z | y) 
+                          for each batch, position, and dimension.
+        """
+        B, L, d, _ = all_y.shape
+        device = all_y.device
+        out = torch.empty((B, L, d, L, d), device=device)
+        all_y_flat = all_y.view(B*L*d, L)
+        
+        start = 0
+        while start < (B*L*d):
+            end = min(start + chunk_size, B*L*d)
+            chunk = all_y_flat[start:end]
+            t_tensor = t * torch.ones(chunk.size(0), 1, device=device)
+            
+            pi_z_given_y_chunk = self._build_distrib(chunk, t_tensor, t, full_scores=True).detach()
+            
+            out.view(B*L*d, L, d)[start:end] = pi_z_given_y_chunk
+            start = end
+        
+        return out  # shape [B, L, d, L, d]
+
+  
+  def sample_from_pi_z_given_y(self, pi_z_given_y, M):
+    """
+    Sample M sequences z ~ π(z | y) for each neighbor y.
+
+    Args:
+        pi_z_given_y: [B, L, d, L, d] — categorical distributions over [L, d] for each neighbor y
+        M: number of samples to draw per distribution
+
+    Returns:
+        sampled_z: [B, L, d, M, L] — M sampled sequences per π(z | y)
+    """
+    B, L, d, _, _ = pi_z_given_y.shape  # [B, L, d, L, d]
+
+    device = pi_z_given_y.device
+
+    # Flatten to sample everything at once
+    pi_flat = pi_z_given_y.view(B * L * d, L, d)  # [B*L*d, L, d]
+
+    # Reshape for multinomial: [B*L*d * L, d]
+    pi_for_sampling = pi_flat.reshape(-1, d)
+
+    # Sample M times from each categorical distribution over d
+    samples = torch.multinomial(pi_for_sampling, num_samples=M, replacement=True)  # [B*L*d * L, M]
+
+    # Reshape to [B*L*d, L, M]
+    samples = samples.view(B * L * d, L, M).permute(0, 2, 1)  # [B*L*d, M, L]
+
+    # Final reshape to [B, L, d, M, L]
+    sampled_sequences = samples.view(B, L, d, M, L)
+
+    return sampled_sequences  # [B, L, d, M, L]
+
+  
+  def compute_expression(self, pi_z_given_y, sampled_sequences, t, full_scores):
+    """
+    Compute π_y(θ = i) for each y = x with position i replaced by v,
+    using SNIS in probability space. Output: [B, L, d]
+    """
+    B, L, d, _, _ = pi_z_given_y.shape
+    M = sampled_sequences.shape[3]
+
+    # 1. Extract π(z_i | y)
+    pi_expanded = pi_z_given_y.unsqueeze(3).expand(B, L, d, M, L, d)  # [B, L, d, M, L, d]
+    sampled_indices = sampled_sequences.unsqueeze(-1)  # [B, L, d, M, L, 1]
+    pi_z_given_y_sampled = torch.gather(pi_expanded, -1, sampled_indices).squeeze(-1)  # [B, L, d, M, L]
+
+    # 2. Estimate π(z_i) ≈ 1 / score
+    flat_z = sampled_sequences.reshape(B * L * d * M, L)
+    scores = self.forward_at_time(flat_z, t, full_scores=full_scores).clamp(min=1e-8)  # [B*L*d*M, L, d]
+    pi_z_i = 1.0 / scores
+    pi_z_i = pi_z_i.view(B, L, d, M, L, d)
+    sampled_indices = sampled_indices.expand(B, L, d, M, L, 1)
+    pi_z_i_sampled = torch.gather(pi_z_i, -1, sampled_indices).squeeze(-1)  # [B, L, d, M, L]
+
+    # 3. Compute importance weights: w = π(z_i) / π(z_i | y)
+    weights = pi_z_i_sampled / (pi_z_given_y_sampled + 1e-8)  # [B, L, d, M, L]
+
+    # 4. Get π_{y|z}(θ = i) and weights at θ = i
+    # Use the diagonal over the θ-dimension (last dimension) → index θ = i
+    pi_y_given_z_theta_i = pi_z_given_y_sampled.diagonal(dim1=3, dim2=4)  # [B, L, d, M]
+    weights_theta_i = weights.diagonal(dim1=3, dim2=4)  # [B, L, d, M]
+
+    # 5. SNIS: numerator and normalization
+    numerator = (pi_y_given_z_theta_i * weights_theta_i).sum(dim=-1)  # [B, L, d]
+    denominator = weights_theta_i.sum(dim=-1) + 1e-8  # [B, L, d]
+
+    pi_y_theta_i = numerator / denominator  # [B, L, d]
+
+    return pi_y_theta_i
+
+
+
+  @torch.no_grad()
+  def _compute_pi_y(self, x, t=0.0, full_scores=True, M=2):
+        """
+        Computes pi_y using the internal methods of the class.
+
+        Arguments:
+            - x: Inputs (batch).
+            - t: Current time or step (default = 0.0).
+            - full_scores: Boolean indicating whether full scores should be computed (default = True).
+            - M: Number of samples to draw for each sequence (default = 10).
+
+        Returns:
+            - pi_y: Tensor containing pi_y of size [B, L * d].
+        """
+
+
+        all_y_hamming_distance_0_and_1 = self.generate_all_hamming_distance_0_and_1(x, self.vocab_size) # [B,L,d,L]
+
+        pi_z_given_y = self.compute_pi_z_given_y(t, all_y_hamming_distance_0_and_1)  # Shape:  [B, L, d, L, d]
+
+        sampled_sequences = self.sample_from_pi_z_given_y(pi_z_given_y, M)  # Shape: [B, L, d, M, L]
+
+        pi_y = self.compute_expression(pi_z_given_y, sampled_sequences, t, full_scores)  # Shape: [B, L * d]
+
+        return pi_y
+  
+  def _compute_loss_sepo(self, rew, s_t_old_x_z, pi_old_z, x, t=0.0, epsilon=0.2, full_scores=True, M=10):
       
     bsz = rew.shape[0] # input size
 
@@ -745,20 +923,20 @@ class Diffusion(L.LightningModule):
 
     s_t_x_y = log_s_t_x_y.exp()
     s_t_x_y_detach = s_t_x_y.detach().clone()
-    pi_y = self._build_distrib(x, t* torch.ones(x.shape[0], 1, device=self.device), t, full_scores=full_scores).detach()
+
+    with torch.no_grad():
+      pi_y = self._compute_pi_y(x, t, full_scores, M)
 
     ratio_y = pi_y/pi_old_z
     ratio_s = s_t_old_x_z/s_t_x_y_detach
 
     clipped_both = torch.clamp(ratio_s*ratio_y, 1 - epsilon, 1 + epsilon)
 
-    pi_x = pi_y/s_t_x_y_detach
+    product = pi_y*ratio_y*ratio_s
+    clipped_product = pi_y*clipped_both
 
-    product = pi_x*ratio_y*ratio_s
-    clipped_product = pi_x*clipped_both
-
-    inner_sum = torch.sum(product*s_t_x_y,dim=(1, 2))
-    clipped_inner_sum = torch.sum(clipped_product*s_t_x_y,dim=(1, 2))
+    inner_sum = torch.sum(product*log_s_t_x_y,dim=(1, 2))
+    clipped_inner_sum = torch.sum(clipped_product*log_s_t_x_y,dim=(1, 2))
 
     loss = (1/bsz) * (torch.dot(rew,inner_sum))
     clipped_loss = (1/bsz) * (torch.dot(rew,clipped_inner_sum))

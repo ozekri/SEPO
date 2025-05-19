@@ -97,14 +97,18 @@ def fine_tune(new_model, reward_model, old_model, ref_model, args):
                 entropy_loss = 0.0
                 for i, xr_old in enumerate(xr_olds):
                     s_t_old_x_z = old_model.forward_at_time(xr_old, dt, full_scores=True).exp().detach()
-                    pi_old_z = old_model._build_distrib(xr_old, dt* torch.ones(x_old.shape[0], 1, device=old_model.device), dt, full_scores=True).detach()
-                    pi_old_z[:, :, 4] = eps_error
+                    with torch.no_grad():
+                        pi_old_z = old_model._compute_pi_y(xr_old, dt, full_scores=True, M=args.M)
                     
                     reward = reward_list[i]
                     rewards.append(reward.detach().cpu().numpy())
 
-                    reward_loss = reward_loss + new_model._compute_loss_sepo(reward, s_t_old_x_z, pi_old_z, xr_old, t=dt, epsilon=args.eps_grpo, full_scores=True)
-                        
+                    if args.dr_grpo:
+                        unb = reward.shape[0]
+                        reward_loss = reward_loss + unb*new_model._compute_loss_sepo(reward, s_t_old_x_z, pi_old_z, xr_old, t=dt, epsilon=args.eps_grpo, full_scores=True, M=args.M)
+                    else:
+                        reward_loss = reward_loss + new_model._compute_loss_sepo(reward, s_t_old_x_z, pi_old_z, xr_old, t=dt, epsilon=args.eps_grpo, full_scores=True, M=args.M)
+                                                
                 reward_loss = - reward_loss / args.grpo # The minus sign is correct here, check the paper if not conviced !
                 
                 ### potential KL term
@@ -252,6 +256,10 @@ argparser.add_argument("--mu_grpo", type=int, default=5,
                         help="GRPO smoothing parameter.")
 argparser.add_argument('--eps_grpo', type=float, default=0.2,
                         help="Epsilon parameter for GRPO.")
+argparser.add_argument('--dr_grpo', type=str2bool, default=False,
+                        help="Enable DR-GRPO.")
+argparser.add_argument('--M', type=int, default=2,
+                        help="Number of samples for SNIS.")
 
 args = argparser.parse_args()
 print(args)
